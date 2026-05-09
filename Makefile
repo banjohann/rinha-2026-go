@@ -15,7 +15,7 @@ run: build preprocess
 	DATA_DIR=./data LISTEN_ADDR=:8000 ./bin/api
 
 docker:
-	DOCKER_BUILDKIT=1 docker build --platform=linux/amd64 -t banjohann/rinha-2026-go:v1 .
+	docker build -t banjohann/rinha-2026-go:v1 .
 
 compose-up: docker
 	docker compose up -d
