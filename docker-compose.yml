@@ -1,6 +1,6 @@
 services:
   api-1:
-    image: banjohann/rinha-2026-go:v1
+    image: banjohann/rinha-2026-go:v2
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
@@ -15,7 +15,7 @@ services:
           memory: "160MB"
 
   api-2:
-    image: banjohann/rinha-2026-go:v1
+    image: banjohann/rinha-2026-go:v2
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
