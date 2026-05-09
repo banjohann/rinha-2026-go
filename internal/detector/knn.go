@@ -1,7 +1,17 @@
 package detector
 
+import (
+	"runtime"
+	"sync"
+)
+
 // K is the number of nearest neighbors used in the fraud vote.
 const K = 5
+
+// minParallelN is the dataset-size threshold below which we just do a
+// single sequential scan. Spawning goroutines for a few thousand refs
+// costs more in scheduler overhead than it saves.
+const minParallelN = 1024
 
 // sentinelGapSq is the squared distance contribution when one side of a
 // dimension is the sentinel and the other is not. Equal to the maximum
@@ -10,6 +20,24 @@ const K = 5
 // QuantScale² = 65534² = 4_294_705_156 — fits in uint32; the per-query
 // accumulator uses uint64 to safely sum 14 such contributions.
 const sentinelGapSq uint64 = uint64(QuantScale) * uint64(QuantScale)
+
+// knnWorkers picks the number of goroutines used per query. Capped to
+// keep scheduler overhead low on the small CPU quota each container has.
+//
+// We don't import golang.org/x/automaxprocs (stdlib-only constraint), so
+// GOMAXPROCS reflects the host CPU count, not the container quota.
+// 4 is a pragmatic upper bound: the test machine is a 4-thread Mac Mini
+// and our container's CPU share splits across at most that many cores.
+func knnWorkers() int {
+	w := runtime.GOMAXPROCS(0)
+	if w > 4 {
+		w = 4
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
 
 // dimContrib returns (a-b)² with sentinel handling.
 //
@@ -56,7 +84,6 @@ func (h *fixedHeap) push(d uint64, label uint8) {
 		h.dist[i] = d
 		h.label[i] = label
 		h.size++
-		// sift up
 		for i > 0 {
 			parent := (i - 1) / 2
 			if h.dist[parent] >= h.dist[i] {
@@ -73,7 +100,6 @@ func (h *fixedHeap) push(d uint64, label uint8) {
 	}
 	h.dist[0] = d
 	h.label[0] = label
-	// sift down
 	i := 0
 	for {
 		l := 2*i + 1
@@ -105,21 +131,17 @@ func (h *fixedHeap) fraudCount() int {
 	return c
 }
 
-// TopKFraudCount scans all references and returns how many of the K
-// nearest are labeled as fraud. The caller derives fraud_score from this.
-//
-// Brute-force: O(N * Dims) integer ops per query. With N=3M, Dims=14,
-// this is ~42M ops; tractable on a single 0.45-CPU container.
-func (s *Store) TopKFraudCount(q [Dims]uint16) int {
+// scanRange computes the K nearest neighbours within s.Vectors[start:end]
+// and returns the local heap. Used both as the sequential implementation
+// and as the per-worker function during parallel scans.
+func (s *Store) scanRange(q [Dims]uint16, start, end int) fixedHeap {
 	var h fixedHeap
 	v := s.Vectors
-	for i := 0; i < s.N; i++ {
+	for i := start; i < end; i++ {
 		base := i * Dims
-		// Compute squared distance with early termination once we
-		// exceed the current worst keeper (only valid when full).
 		var d uint64
 		full := h.size == K
-		worst := uint64(0)
+		var worst uint64
 		if full {
 			worst = h.max()
 		}
@@ -136,5 +158,50 @@ func (s *Store) TopKFraudCount(q [Dims]uint16) int {
 		}
 		h.push(d, s.Labels[i])
 	}
-	return h.fraudCount()
+	return h
+}
+
+// TopKFraudCount scans all references and returns how many of the K
+// nearest are labeled as fraud. The caller derives fraud_score from this.
+//
+// For datasets above minParallelN, the work is split across knnWorkers()
+// goroutines, each maintaining its own heap; the K survivors from each
+// worker are merged into a final heap.
+func (s *Store) TopKFraudCount(q [Dims]uint16) int {
+	if s.N == 0 {
+		return 0
+	}
+	workers := knnWorkers()
+	if workers <= 1 || s.N < minParallelN {
+		h := s.scanRange(q, 0, s.N)
+		return h.fraudCount()
+	}
+
+	chunk := (s.N + workers - 1) / workers
+	locals := make([]fixedHeap, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > s.N {
+			end = s.N
+		}
+		if start >= end {
+			break
+		}
+		wg.Add(1)
+		go func(w, start, end int) {
+			defer wg.Done()
+			locals[w] = s.scanRange(q, start, end)
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	var merged fixedHeap
+	for _, h := range locals {
+		for j := 0; j < h.size; j++ {
+			merged.push(h.dist[j], h.label[j])
+		}
+	}
+	return merged.fraudCount()
 }
