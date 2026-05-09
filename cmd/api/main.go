@@ -29,10 +29,10 @@ func main() {
 	srv := server.New(mcc, norm)
 
 	go func() {
-		refsPath := filepath.Join(dataDir, "references.json.gz")
+		refsPath := filepath.Join(dataDir, "index.bin")
 		log.Printf("loading references from %s", refsPath)
 		t0 := time.Now()
-		st, err := detector.LoadStore(refsPath, 3_000_000)
+		st, err := detector.LoadStoreFromBinary(refsPath)
 		if err != nil {
 			log.Fatalf("load references: %v", err)
 		}

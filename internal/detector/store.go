@@ -1,7 +1,9 @@
 package detector
 
 import (
+	"bufio"
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -98,4 +100,37 @@ func labelToByte(l string) uint8 {
 func hasGzipExt(path string) bool {
 	n := len(path)
 	return n >= 3 && path[n-3:] == ".gz"
+}
+
+// LoadStoreFromBinary reads the compact binary index produced by
+// cmd/preprocess. The format is documented at the top of that command.
+//
+// Skips JSON decoding and gzip decompression entirely, so cold-start
+// drops from ~10 s to ~100 ms.
+func LoadStoreFromBinary(path string) (*Store, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readStoreBinary(bufio.NewReader(f))
+}
+
+func readStoreBinary(r io.Reader) (*Store, error) {
+	var n uint32
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+	s := &Store{
+		N:       int(n),
+		Vectors: make([]uint16, int(n)*Dims),
+		Labels:  make([]uint8, int(n)),
+	}
+	if err := binary.Read(r, binary.LittleEndian, s.Vectors); err != nil {
+		return nil, fmt.Errorf("read vectors: %w", err)
+	}
+	if _, err := io.ReadFull(r, s.Labels); err != nil {
+		return nil, fmt.Errorf("read labels: %w", err)
+	}
+	return s, nil
 }

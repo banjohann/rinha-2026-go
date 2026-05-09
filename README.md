@@ -1,57 +1,208 @@
 # rinha-2026-go
 
-Go implementation of the [Rinha de Backend 2026](../rinha-de-backend-2026) fraud-detection challenge.
+Submissão da [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026) — uma API de detecção de fraude por busca vetorial em transações de cartão.
 
-## Stack
+**Stack**: Go (stdlib pura, sem frameworks) + HAProxy. Sem banco de dados, sem vector DB — todas as 3 milhões de referências ficam em RAM, em formato compactado.
 
-- **Language**: Go (stdlib only — `net/http`, `encoding/json`, `compress/gzip`)
-- **Load balancer**: HAProxy (round-robin)
-- **Storage**: 3M reference vectors held in RAM per instance, quantized to `uint8`
-- **Search**: brute-force k-NN (k=5) with squared Euclidean distance and a fixed-size max-heap
-
-## Layout
+## Arquitetura
 
 ```
-cmd/api/             entrypoint
-internal/detector/   vectorize, quantize, store, k-NN
-internal/server/     HTTP handlers (/ready, /fraud-score)
-data/                normalization.json, mcc_risk.json, references.json.gz
-haproxy/             haproxy.cfg
+                Cliente
+                  │
+                  ▼
+         ┌──────────────────┐
+         │  HAProxy :9999   │  round-robin, sem lógica de detecção
+         └────────┬─────────┘
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+   ┌──────────┐        ┌──────────┐
+   │  api-1   │        │  api-2   │  Go, net/http, sem framework
+   │  :8000   │        │  :8000   │
+   │          │        │          │  Cada uma carrega as 3M
+   │  Store   │        │  Store   │  referências em RAM no startup
+   │ (uint16) │        │ (uint16) │
+   └──────────┘        └──────────┘
 ```
 
-## Run
+Limites do desafio: **1 CPU e 350 MB de RAM** distribuídos entre todos os containers.
+
+| Serviço | CPU  | Memória |
+|---------|------|---------|
+| HAProxy | 0.10 | 30 MB   |
+| api-1   | 0.45 | 160 MB  |
+| api-2   | 0.45 | 160 MB  |
+| **Total** | **1.00** | **350 MB** |
+
+## Endpoints
+
+- `GET /ready` — retorna **503** enquanto as referências estão sendo carregadas (~5–15 s no startup); **200** depois.
+- `POST /fraud-score` — recebe a transação, retorna `{ approved, fraud_score }`.
+
+Contrato completo do payload em [API.md](https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/API.md).
+
+## Etapas macro de uma requisição
+
+```
+1. POST /fraud-score com payload de transação
+2. Decode JSON       → struct Request               (encoding/json)
+3. Vetoriza          → [14]float32                  (REGRAS_DE_DETECCAO.md)
+4. Quantiza          → [14]uint16                   (mesmo formato do Store)
+5. Busca k-NN        → 5 vizinhos mais próximos     (brute-force)
+6. Vota              → fraud_score = #fraud / 5
+7. Decide            → approved = fraud_score < 0.6
+8. Encode JSON       → resposta
+```
+
+## Como funciona a busca vetorial
+
+### 1. Vetorização (14 dimensões)
+
+Cada transação é mapeada para um vetor de 14 floats em `[0, 1]`, seguindo as fórmulas da especificação. As constantes (`max_amount`, `max_km`, etc.) vêm de `data/normalization.json`.
+
+| Índice | Dimensão | Fórmula |
+|---|---|---|
+| 0  | `amount`               | `clamp(amount / 10000)` |
+| 1  | `installments`         | `clamp(installments / 12)` |
+| 2  | `amount_vs_avg`        | `clamp((amount / customer.avg_amount) / 10)` |
+| 3  | `hour_of_day`          | `hour / 23` (UTC) |
+| 4  | `day_of_week`          | `dayOfWeek / 6` (Mon=0..Sun=6) |
+| 5  | `minutes_since_last_tx`| `clamp(min/1440)` ou **`-1`** se `last_transaction == null` |
+| 6  | `km_from_last_tx`      | `clamp(km/1000)`  ou **`-1`** se `last_transaction == null` |
+| 7  | `km_from_home`         | `clamp(km / 1000)` |
+| 8  | `tx_count_24h`         | `clamp(count / 20)` |
+| 9  | `is_online`            | `0 ou 1` |
+| 10 | `card_present`         | `0 ou 1` |
+| 11 | `unknown_merchant`     | `1` se merchant não conhecido pelo cliente |
+| 12 | `mcc_risk`             | lookup em `mcc_risk.json` (default `0.5`) |
+| 13 | `merchant_avg_amount`  | `clamp(avg / 10000)` |
+
+O sentinel **`-1`** nas dimensões 5 e 6 sinaliza ausência de transação anterior. É preservado em todo o pipeline (não é tratado como zero) para não confundir "sem histórico" com "histórico recente e próximo".
+
+Implementação em [`internal/detector/vector.go`](internal/detector/vector.go).
+
+### 2. Quantização (`uint16`)
+
+Manter 3M × 14 floats × 4 bytes em RAM custaria **168 MB por instância** — ultrapassa o limite de 350 MB para duas réplicas. A solução é quantizar:
+
+- Cada dimensão `[0, 1]` → `[0, 65534]` (uint16, 16 bits)
+- Sentinel `-1` → `65535`
+- Erro de quantização: ~1.5×10⁻⁵ por dimensão (efetivamente lossless para a precisão dos dados)
+- Memória resultante: **~84 MB por instância** (3M × 14 × 2 bytes vetores + 3M × 1 byte labels)
+
+A distância euclidiana ao quadrado entre dois quantizados pode exceder `int32`, então o cálculo usa `uint64` no acumulador e diferença absoluta em `uint32` antes de elevar ao quadrado — evita overflow silencioso.
+
+Implementação em [`internal/detector/quantize.go`](internal/detector/quantize.go).
+
+### 3. Storage in-memory
+
+```go
+type Store struct {
+    Vectors []uint16  // flat: N*14, vetor i ocupa [i*14 : (i+1)*14]
+    Labels  []uint8   // 0 = legit, 1 = fraud
+    N       int
+}
+```
+
+Layout flat (não `[][]uint16`) para reduzir overhead de slice headers e melhorar localidade de cache durante o scan.
+
+O carregamento usa `compress/gzip` + `json.Decoder` em modo streaming — decodifica registro por registro e quantiza inline, sem materializar o array completo de 3M `referenceRecord` na memória ao mesmo tempo.
+
+Implementação em [`internal/detector/store.go`](internal/detector/store.go).
+
+### 4. Busca k-NN (k=5, brute-force)
+
+Para cada query:
+
+```
+para cada referência i de 0 a N-1:
+    d² = Σ contrib(query[j], ref[j])  para j = 0..13
+    se d² < pior_distância_no_heap:
+        substitui pior pelo novo (d², label)
+```
+
+- **Distância**: euclidiana ao quadrado (sem `sqrt` — métrica monotônica, ranking idêntico)
+- **Sentinel**: `contrib(sentinel, sentinel) = 0` (match perfeito); `contrib(sentinel, valor) = QuantScale²` (custo máximo, separa os dois grupos)
+- **Heap**: max-heap fixo de tamanho 5 — o pior elemento (maior distância) fica no topo, então comparação contra `heap[0]` decide se vale a pena processar a referência inteira
+- **Early termination**: a soma das contribuições de cada dimensão é monotonicamente crescente — assim que `d² ≥ pior_no_heap`, abortamos a iteração da referência atual e pulamos para a próxima
+
+Custo por query: **~42 M operações inteiras** (3M refs × 14 dims), tipicamente parando bem antes nos últimos elementos por causa do early termination.
+
+Implementação em [`internal/detector/knn.go`](internal/detector/knn.go).
+
+### 5. Decisão
+
+```go
+fraudCount := store.TopKFraudCount(quantizedQuery)
+score      := float32(fraudCount) / 5.0
+approved   := score < 0.6
+```
+
+Como `k = 5`, `fraud_score` só pode assumir 6 valores discretos: `0.0, 0.2, 0.4, 0.6, 0.8, 1.0`.
+
+## Layout do projeto
+
+```
+cmd/api/                  entrypoint: carrega dados, sobe HTTP server
+internal/detector/
+  vector.go               vetorização (14 dimensões)
+  quantize.go             float32 ↔ uint16 com sentinel
+  store.go                Store em RAM, streaming gzip+JSON loader
+  knn.go                  brute-force k-NN com max-heap fixo
+  mcc.go, normalization.go  loaders dos JSONs auxiliares
+  types.go                Request/Response (também usado pelo server)
+internal/server/
+  server.go               http.Server, atomic.Pointer[Store]
+  handlers.go             /ready (503/200) e /fraud-score
+data/                     normalization.json, mcc_risk.json, references.json.gz
+haproxy/haproxy.cfg       round-robin com health check em /ready
+Dockerfile                multi-stage, distroless, ~70 MB
+docker-compose.yml        haproxy + 2 APIs com limits de CPU/RAM
+```
+
+## Como rodar
+
+### Testes unitários
 
 ```sh
-# Tests
 make test
-
-# Local single instance (no LB)
-make run
-curl localhost:8000/ready          # 503 while loading, 200 once loaded
-
-# Full stack via docker-compose (HAProxy + 2 APIs)
-make compose-up
-curl localhost:9999/ready
-curl -X POST localhost:9999/fraud-score \
-     -H 'content-type: application/json' \
-     -d @../rinha-de-backend-2026/resources/example-payloads.json
 ```
 
-## Memory budget
+Cobre: vetorização (com os exemplos da spec), round-trip de quantização (incluindo sentinel), k-NN comparado a um oráculo naïve em 50 queries randômicas, sentinel clustering, loaders de gzip, handlers (`httptest`).
 
-| Service     | CPU  | Memory |
-|-------------|------|--------|
-| HAProxy     | 0.10 | 30 MB  |
-| api-1       | 0.45 | 160 MB |
-| api-2       | 0.45 | 160 MB |
-| **Total**   | 1.00 | 350 MB |
+### Local, sem container
 
-Per-instance: ~45 MB references (3M × 14 bytes vectors + 3M × 1 byte labels) + Go runtime overhead.
+```sh
+DATA_DIR=./data make run
+curl -i localhost:8000/ready          # 503 enquanto carrega, 200 depois
+```
 
-## Quantization
+### Stack completa via docker-compose
 
-Each `[0,1]` vector dim maps to `[0, 254]`. The value `255` is reserved as the
-`-1` sentinel for dims 5 and 6 when `last_transaction == null`. Distance
-contribution between two non-sentinel values is `(a-b)²`; between a sentinel
-and a non-sentinel it is `254² = 64516` (max per-dim cost), so sentinel and
-non-sentinel records cluster apart.
+```sh
+make docker         # builda a imagem amd64
+docker compose up -d
+curl -i localhost:9999/ready
+curl -X POST localhost:9999/fraud-score \
+  -H 'Content-Type: application/json' \
+  -d @../rinha-de-backend-2026/resources/example-payloads.json
+```
+
+## Decisões de projeto e trade-offs
+
+- **Sem framework HTTP**: `net/http` da stdlib é suficiente; cada handler é uma goroutine, sem middleware no caminho quente.
+- **Sem vector DB**: para 3M × 14 dims, o overhead de IPC + serialização de qualquer DB externo (pgvector, Qdrant) seria maior que o ganho. Em RAM com layout flat, o k-NN é cache-friendly.
+- **Brute-force ao invés de ANN (HNSW/IVF)**: menos código, zero parametrização, resultado exato. Pra v1 é o suficiente — ANN fica como otimização caso o p99 fique inviável.
+- **Quantização uint16 ao invés de uint8 ou float32**: `uint8` (255 níveis) introduzia ruído mensurável no ranking dos top-5; `float32` estourava memória; `uint16` é o ponto ótimo.
+- **Pré-processamento no startup, não no build**: simplifica o desenvolvimento (mesma imagem serve qualquer dataset). Custo: `/ready` fica em 503 por ~10 s. O test runner da Rinha aguarda essa janela.
+- **HAProxy com `option httpchk GET /ready`**: garante que requisições não cheguem nas APIs antes do Store estar pronto.
+
+## Limitações conhecidas / próximos passos
+
+- p99 da v1 com brute-force fica na faixa de ~50–200 ms sob 0.45 CPU. Caminho de otimização: paralelizar o scan em N goroutines por query, ou trocar pra HNSW com 64 vizinhos pré-construídos.
+- Encoding/Decoding de JSON é um hot spot — substituir por `encoding/json/v2` (Go 1.26+) ou um parser custom (sonic, jsoniter) deve dar ganho mensurável.
+- O `references.json.gz` (48 MB) está dentro da imagem; mover para um build stage que pré-quantize para um formato binário compacto cortaria a imagem em ~60% e reduziria startup pra <1 s.
+
+## Licença
+
+MIT

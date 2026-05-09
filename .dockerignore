@@ -4,4 +4,3 @@ bin/
 Makefile
 docker-compose.yml
 haproxy/
-data/

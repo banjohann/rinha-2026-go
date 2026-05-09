@@ -1,14 +1,11 @@
 services:
   api-1:
-    build: .
-    image: rinha-2026-go:latest
+    image: banjohann/rinha-2026-go:v1
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
       GOGC: "75"
       GOMEMLIMIT: "150MiB"
-    volumes:
-      - ./data:/data:ro
     networks:
       - rinha
     deploy:
@@ -18,14 +15,12 @@ services:
           memory: "160MB"
 
   api-2:
-    image: rinha-2026-go:latest
+    image: banjohann/rinha-2026-go:v1
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
       GOGC: "75"
       GOMEMLIMIT: "150MiB"
-    volumes:
-      - ./data:/data:ro
     networks:
       - rinha
     depends_on:
