@@ -1,7 +1,6 @@
 services:
   api-1:
     image: banjohann/rinha-2026-go:v1
-    build: .
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
