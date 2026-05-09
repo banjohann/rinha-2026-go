@@ -1,0 +1,7 @@
+bin/
+.git/
+*.md
+Makefile
+docker-compose.yml
+haproxy/
+data/

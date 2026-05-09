@@ -1,0 +1,58 @@
+services:
+  api-1:
+    build: .
+    image: rinha-2026-go:latest
+    environment:
+      LISTEN_ADDR: ":8000"
+      DATA_DIR: /data
+      GOGC: "75"
+      GOMEMLIMIT: "150MiB"
+    volumes:
+      - ./data:/data:ro
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+  api-2:
+    image: rinha-2026-go:latest
+    environment:
+      LISTEN_ADDR: ":8000"
+      DATA_DIR: /data
+      GOGC: "75"
+      GOMEMLIMIT: "150MiB"
+    volumes:
+      - ./data:/data:ro
+    networks:
+      - rinha
+    depends_on:
+      - api-1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api-1
+      - api-2
+    networks:
+      - rinha
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+
+networks:
+  rinha:
+    driver: bridge
