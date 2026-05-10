@@ -3,7 +3,15 @@ package detector
 import (
 	"runtime"
 	"sync"
+	"time"
 )
+
+// Timings captures per-stage IVF latency for instrumentation. nil disables
+// measurement on the hot path.
+type Timings struct {
+	Centroids time.Duration
+	Scan      time.Duration
+}
 
 // K is the number of nearest neighbors used in the fraud vote.
 const K = 5
@@ -200,22 +208,40 @@ func (s *Store) topPCentroids(q [Dims]uint16, p int) []int {
 // PProbes nearest clusters. Otherwise it falls back to a brute-force
 // scan over all records, parallelised for large N.
 func (s *Store) TopKFraudCount(q [Dims]uint16) int {
+	return s.TopKFraudCountTimed(q, nil)
+}
+
+// TopKFraudCountTimed is identical to TopKFraudCount but, when t is non-nil,
+// records the time spent in centroid lookup and cluster scan into t. Each
+// time.Now() costs ~30 ns; passing nil disables them entirely.
+func (s *Store) TopKFraudCountTimed(q [Dims]uint16, t *Timings) int {
 	if s.N == 0 {
 		return 0
 	}
 	if s.K > 0 {
-		return s.topKIVF(q)
+		return s.topKIVF(q, t)
 	}
 	return s.topKBrute(q)
 }
 
-func (s *Store) topKIVF(q [Dims]uint16) int {
+func (s *Store) topKIVF(q [Dims]uint16, t *Timings) int {
+	var tStart, tMid time.Time
+	if t != nil {
+		tStart = time.Now()
+	}
 	clusters := s.topPCentroids(q, PProbes)
+	if t != nil {
+		tMid = time.Now()
+		t.Centroids = tMid.Sub(tStart)
+	}
 	var h fixedHeap
 	for _, c := range clusters {
 		start := int(s.Offsets[c])
 		end := int(s.Offsets[c+1])
 		s.scanRange(q, start, end, &h)
+	}
+	if t != nil {
+		t.Scan = time.Since(tMid)
 	}
 	return h.fraudCount()
 }

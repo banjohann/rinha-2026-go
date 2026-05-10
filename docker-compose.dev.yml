@@ -1,0 +1,24 @@
+# Local dev overlay. NOT auto-loaded — must be passed explicitly:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Renamed from docker-compose.override.yml so it can't accidentally apply to
+# a prévia run. The engine clones the `submission` branch (which doesn't have
+# this file), but the override-name convention auto-loads in any CWD — risky.
+#
+# - Overrides image tag to a dev build (v4-metrics) with instrumentation
+# - Adds `build: .` so `--build` compiles locally without pushing to Docker Hub
+# - Exposes api-1 on host port 8001 so we can curl /debug/metrics and pprof
+#
+# Production docker-compose.yml stays clean: no build:, no ports, no dev tag.
+# Both branches keep an identical, prévia-safe compose.
+services:
+  api-1:
+    image: banjohann/rinha-2026-go:v5
+    build:
+      context: .
+    ports:
+      - "127.0.0.1:8001:8000"
+  api-2:
+    image: banjohann/rinha-2026-go:v5
+    build:
+      context: .

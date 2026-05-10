@@ -1,3 +1,4 @@
 bin/
 data/references.json.gz
 data/index.bin
+runs/
