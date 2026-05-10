@@ -1,26 +1,30 @@
 services:
   api-1:
-    image: banjohann/rinha-2026-go:v3
+    image: banjohann/rinha-2026-go:v5
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
       GOGC: "75"
       GOMEMLIMIT: "150MiB"
+      METRICS: "${METRICS:-}"
+      PPROF: "${PPROF:-}"
     networks:
       - rinha
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "160MB"
 
   api-2:
-    image: banjohann/rinha-2026-go:v3
+    image: banjohann/rinha-2026-go:v5
     environment:
       LISTEN_ADDR: ":8000"
       DATA_DIR: /data
       GOGC: "75"
       GOMEMLIMIT: "150MiB"
+      METRICS: "${METRICS:-}"
+      PPROF: "${PPROF:-}"
     networks:
       - rinha
     depends_on:
@@ -28,7 +32,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "160MB"
 
   haproxy:
@@ -45,7 +49,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.20"
           memory: "30MB"
 
 networks:
