@@ -9,6 +9,7 @@ Cada prévia é uma execução do `rinha/test` na engine oficial. Linha de basel
 | 01 | 2026-05-09 | `0cf9fe3` | **-6000** | 2001.96 ms (cap) | 39.466 | 92 | 54.100 | brute-force k-NN sequencial, uint16, dados em `/data` |
 | 02 | 2026-05-09 | `0cf9fe3` | **-6000** | 2001.89 ms (cap) | 45.964 | 105 | 54.100 | _idem 01 — imagem não foi republicada, código novo não foi testado_ |
 | 03 | 2026-05-09 | `f133c09` | **-6000** | 2001.90 ms (cap) | 43.273 | 118 | 54.100 | preprocess no build + k-NN paralelo + `sync.Pool` (`:v2`) |
+| 04 | 2026-05-10 | `a69d127` | **+3026.51** | 257.52 ms | 0 | 53.922 | 54.100 | **Fase 2 IVF** (k-means K=1024, P=3 probes) (`:v3`) |
 
 ## Detalhes
 
@@ -132,6 +133,78 @@ Medição local (host de dev, sem CPU quota):
 - Em container 0.45 CPU, esperado ~2–3 ms por query → throughput por instância ~400 RPS → 2 instâncias = ~800 RPS, próximo dos 900 RPS da carga
 
 Tag bumpada pra `:v3`.
+
+---
+
+### Prévia 04 — 2026-05-10 (`a69d127`, imagem `:v3`)
+
+**Salto qualitativo**: saímos do piso `-6000` e fechamos em `+3026.51`. A Fase 2 (IVF) entregou exatamente o que prometia.
+
+| Métrica | Valor | Δ vs Prévia 03 |
+|---|---|---|
+| Total de requests | 54.100 | = |
+| Acertos TP | 23.973 | +23.914 |
+| Acertos TN | 29.949 | +29.890 |
+| FP | 16 | +16 |
+| FN | 14 | +14 |
+| HTTP errors | **0** | -43.273 |
+| Failure rate | **0.06 %** | -99.67 pp |
+| Weighted errors E (1·FP + 3·FN + 5·Err) | 58 | -216.307 |
+| Error rate ε | 0.001075 | -4.985 |
+| p99 | **257.52 ms** | -1744 ms |
+| score_p99 | **589.19** (cut OFF) | +3589 |
+| score_det | **2437.32** (rate=2968.58, abs_penalty=-531.26, cut OFF) | +5437 |
+| **score_final** | **+3026.51** | +9026 |
+
+**O que isso confirma**:
+- A hipótese H2 (CPU era o gargalo absoluto) era correta. Reduzir o trabalho por query de ~42 M ops pra ~140 K ops (300× menos) liberou throughput e o failure rate desabou.
+- **Edge cases são reais**: 16 FP + 14 FN (30 erros de classificação) com 797 edge cases reportados pelo dataset → ~3.8 % dos edge cases foram errados. Provavelmente IVF está perdendo recall em queries cujos verdadeiros vizinhos caem fora dos 3 clusters mais próximos. Não é dominante no score (penalidade absoluta -531 vs componente positivo +2968), mas é a próxima fronteira de qualidade.
+- p99 de 257 ms ainda está longe do alvo de 1 ms pra `score_p99` máximo. **Esse é agora o gargalo principal do score**.
+
+**Decomposição do score**:
+- score_final = score_p99 (589) + score_det (2437) = 3026.51
+- score_p99 = ƒ(p99). 257 ms rendeu 589. Pra maximizar, precisamos cair pra ~1 ms.
+- score_det = rate_component (2968) - abs_penalty (531). rate_component vai de ~2968 → ~3000 se zerarmos os 30 erros; ganho marginal.
+
+**Conclusão**: o caminho de maior valor agora é **derrubar p99**. 257 ms → 20 ms libera ~3000 pontos a mais no score_p99. Reduzir os 30 erros vale ~500 pontos no detection. **Foco principal: latência**.
+
+**Próximo passo**: instrumentar a aplicação pra medir onde os 257 ms estão sendo gastos e atacar os hotspots. Plano em [`02-instrumentacao.md`](./02-instrumentacao.md).
+
+---
+
+### Mudanças entre 04 e 05 (aplicadas, ainda não testadas)
+
+Investigação seguindo o plano de [`02-instrumentacao.md`](./02-instrumentacao.md):
+
+- **Instrumentação adicionada** (atrás de env flags `METRICS=1` e `PPROF=1`, ambas off por default): histogramas por estágio (decode/vectorize/centroids/ivf_scan/encode/total), contadores `inflight_current/max` e `requests_total` em `/debug/metrics`; pprof completo em `/debug/pprof/*`. Custo quando off: 1 branch predictable por request.
+- **Diagnóstico**: handler interno p99 = 1-2 ms, mas k6 mediu p99 = 386 ms. pprof revelou que a API usa só **19 % da própria quota de CPU** durante carga alta — não é GC, não é CFS throttling, não é algoritmo.
+- **Hipóteses descartadas** (cada uma com run dedicado):
+  - GOMAXPROCS=1: pior (p99 455 ms, inflight_max=1 colapsado por serialização)
+  - HAProxy `http-reuse always`: indiferente (p99 igual ao baseline)
+- **Hipótese confirmada**: HAProxy capado em **0.10 CPU** era o gargalo. A 900 RPS ele precisava de ~1.1 ms de CPU por request, exatamente no teto da janela CFS → fila no frontend.
+- **Solução**: redistribuir 0.05 CPU de cada API pro HAProxy. Total continua 1.00.
+
+| Serviço | CPU 04 | CPU 05 |
+|---|---|---|
+| api-1 | 0.45 | **0.40** |
+| api-2 | 0.45 | **0.40** |
+| haproxy | 0.10 | **0.20** |
+
+**Também aplicado**: `http-reuse always` no HAProxy (mantido — não atrapalha, e em produção real pode ajudar diferente do que em localhost).
+
+**Resultado local com a nova alocação**:
+
+| Métrica | Local 04 | Local 05 | Δ |
+|---|---|---|---|
+| p99 k6 | 386 ms | **1.73 ms** | **−223×** |
+| handler p99 (interno) | 2 ms | 1 ms | ~ |
+| TP+TN | 53.813 | 54.026 | +213 |
+| p99_score | 412 | **2763** | +2351 |
+| final_score | 2849 | **5201** | **+82 %** |
+
+Local sempre subestima ~7 % vs prévia oficial. Predição: **score oficial Prévia 05 entre +4800 e +5500**.
+
+Imagem `:v5`.
 
 ---
 
