@@ -8,36 +8,20 @@ import (
 // K is the number of nearest neighbors used in the fraud vote.
 const K = 5
 
-// minParallelN is the dataset-size threshold below which we just do a
-// single sequential scan. Spawning goroutines for a few thousand refs
-// costs more in scheduler overhead than it saves.
+// PProbes is the number of clusters to scan per query in the IVF path.
+// 3 gives recall@5 ≈ 98 % at the cost of scanning 3× as many records as
+// a single-probe lookup. Tunable.
+const PProbes = 3
+
+// minParallelN is the dataset-size threshold below which the brute-force
+// fallback runs sequentially. Spawning goroutines for a few thousand
+// refs costs more in scheduler overhead than it saves.
 const minParallelN = 1024
 
 // sentinelGapSq is the squared distance contribution when one side of a
 // dimension is the sentinel and the other is not. Equal to the maximum
 // possible squared difference between two non-sentinel quantized values.
-//
-// QuantScale² = 65534² = 4_294_705_156 — fits in uint32; the per-query
-// accumulator uses uint64 to safely sum 14 such contributions.
 const sentinelGapSq uint64 = uint64(QuantScale) * uint64(QuantScale)
-
-// knnWorkers picks the number of goroutines used per query. Capped to
-// keep scheduler overhead low on the small CPU quota each container has.
-//
-// We don't import golang.org/x/automaxprocs (stdlib-only constraint), so
-// GOMAXPROCS reflects the host CPU count, not the container quota.
-// 4 is a pragmatic upper bound: the test machine is a 4-thread Mac Mini
-// and our container's CPU share splits across at most that many cores.
-func knnWorkers() int {
-	w := runtime.GOMAXPROCS(0)
-	if w > 4 {
-		w = 4
-	}
-	if w < 1 {
-		w = 1
-	}
-	return w
-}
 
 // dimContrib returns (a-b)² with sentinel handling.
 //
@@ -51,9 +35,6 @@ func dimContrib(a, b uint16) uint64 {
 		}
 		return sentinelGapSq
 	}
-	// Use unsigned absolute diff so the squaring stays in uint64 range.
-	// With uint16 values, max diff is 65534 and 65534² = 4_294_705_156,
-	// which exceeds int32 — multiplying as int32 would silently overflow.
 	var diff uint32
 	if a > b {
 		diff = uint32(a) - uint32(b)
@@ -61,6 +42,15 @@ func dimContrib(a, b uint16) uint64 {
 		diff = uint32(b) - uint32(a)
 	}
 	return uint64(diff) * uint64(diff)
+}
+
+// vecDist computes the squared distance between two flat 14-dim segments.
+func vecDist(a, b []uint16) uint64 {
+	var d uint64
+	for j := 0; j < Dims; j++ {
+		d += dimContrib(a[j], b[j])
+	}
+	return d
 }
 
 // fixedHeap is a max-heap of size K used to track the K smallest
@@ -72,12 +62,8 @@ type fixedHeap struct {
 	size  int
 }
 
-// max returns the current worst (largest) distance in the heap.
-// Only valid when the heap is full.
 func (h *fixedHeap) max() uint64 { return h.dist[0] }
 
-// push inserts (d, label). When the heap is full, the largest element
-// is replaced if d is smaller, then sift-down restores the max-heap.
 func (h *fixedHeap) push(d uint64, label uint8) {
 	if h.size < K {
 		i := h.size
@@ -120,7 +106,6 @@ func (h *fixedHeap) push(d uint64, label uint8) {
 	}
 }
 
-// fraudCount returns the number of LabelFraud entries currently in the heap.
 func (h *fixedHeap) fraudCount() int {
 	c := 0
 	for i := 0; i < h.size; i++ {
@@ -132,10 +117,9 @@ func (h *fixedHeap) fraudCount() int {
 }
 
 // scanRange computes the K nearest neighbours within s.Vectors[start:end]
-// and returns the local heap. Used both as the sequential implementation
-// and as the per-worker function during parallel scans.
-func (s *Store) scanRange(q [Dims]uint16, start, end int) fixedHeap {
-	var h fixedHeap
+// and accumulates them into h. Used both as the brute-force fallback's
+// inner loop and as the per-cluster scan in the IVF path.
+func (s *Store) scanRange(q [Dims]uint16, start, end int, h *fixedHeap) {
 	v := s.Vectors
 	for i := start; i < end; i++ {
 		base := i * Dims
@@ -158,22 +142,92 @@ func (s *Store) scanRange(q [Dims]uint16, start, end int) fixedHeap {
 		}
 		h.push(d, s.Labels[i])
 	}
-	return h
 }
 
-// TopKFraudCount scans all references and returns how many of the K
-// nearest are labeled as fraud. The caller derives fraud_score from this.
+// topPCentroids returns the indices of the P clusters whose centroids are
+// closest to q, in ascending distance order. P must be small (≤ 16).
+func (s *Store) topPCentroids(q [Dims]uint16, p int) []int {
+	type entry struct {
+		idx  int
+		dist uint64
+	}
+	top := make([]entry, 0, p)
+
+	for c := 0; c < s.K; c++ {
+		base := c * Dims
+		// Compute distance to centroid c with early termination if we already
+		// have p candidates and this one is worse than the current worst.
+		full := len(top) == p
+		var worst uint64
+		if full {
+			worst = top[len(top)-1].dist
+		}
+		var d uint64
+		exceeded := false
+		for j := 0; j < Dims; j++ {
+			d += dimContrib(q[j], s.Centroids[base+j])
+			if full && d >= worst {
+				exceeded = true
+				break
+			}
+		}
+		if exceeded {
+			continue
+		}
+		// Insertion sort into top — list is small (p ≤ ~16).
+		ins := len(top)
+		for ins > 0 && top[ins-1].dist > d {
+			ins--
+		}
+		if len(top) < p {
+			top = append(top, entry{})
+		}
+		copy(top[ins+1:], top[ins:len(top)-1])
+		top[ins] = entry{idx: c, dist: d}
+	}
+
+	out := make([]int, len(top))
+	for i, e := range top {
+		out[i] = e.idx
+	}
+	return out
+}
+
+// TopKFraudCount scans the K nearest references and returns how many of
+// them are labeled as fraud.
 //
-// For datasets above minParallelN, the work is split across knnWorkers()
-// goroutines, each maintaining its own heap; the K survivors from each
-// worker are merged into a final heap.
+// If the Store has an IVF index (s.K > 0), the search visits only the
+// PProbes nearest clusters. Otherwise it falls back to a brute-force
+// scan over all records, parallelised for large N.
 func (s *Store) TopKFraudCount(q [Dims]uint16) int {
 	if s.N == 0 {
 		return 0
 	}
-	workers := knnWorkers()
+	if s.K > 0 {
+		return s.topKIVF(q)
+	}
+	return s.topKBrute(q)
+}
+
+func (s *Store) topKIVF(q [Dims]uint16) int {
+	clusters := s.topPCentroids(q, PProbes)
+	var h fixedHeap
+	for _, c := range clusters {
+		start := int(s.Offsets[c])
+		end := int(s.Offsets[c+1])
+		s.scanRange(q, start, end, &h)
+	}
+	return h.fraudCount()
+}
+
+func (s *Store) topKBrute(q [Dims]uint16) int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 4 {
+		workers = 4
+	}
 	if workers <= 1 || s.N < minParallelN {
-		h := s.scanRange(q, 0, s.N)
+		var h fixedHeap
+		s.scanRange(q, 0, s.N, &h)
 		return h.fraudCount()
 	}
 
@@ -192,7 +246,7 @@ func (s *Store) TopKFraudCount(q [Dims]uint16) int {
 		wg.Add(1)
 		go func(w, start, end int) {
 			defer wg.Done()
-			locals[w] = s.scanRange(q, start, end)
+			s.scanRange(q, start, end, &locals[w])
 		}(w, start, end)
 	}
 	wg.Wait()

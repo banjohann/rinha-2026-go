@@ -64,7 +64,8 @@ func TestLoadStoreFromGzip(t *testing.T) {
 }
 
 func TestLoadStoreFromBinaryRoundTrip(t *testing.T) {
-	// Hand-write a tiny index.bin and verify LoadStoreFromBinary reads it back.
+	// Hand-write a tiny index.bin (v2 format with IVF) and verify
+	// LoadStoreFromBinary reads it back correctly.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "index.bin")
 	f, err := os.Create(path)
@@ -72,15 +73,18 @@ func TestLoadStoreFromBinaryRoundTrip(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	// 2 records: dims=14 each. record 0 legit (label 0), record 1 fraud (label 1).
+	// 2 records, 1 cluster (everyone in cluster 0).
 	const n = 2
-	if err := writeBinIndex(f, n,
-		[]uint16{
-			0, 1, 2, 3, 4, Sentinel, Sentinel, 7, 8, 9, 10, 11, 12, 13,
-			100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113,
-		},
-		[]uint8{LabelLegit, LabelFraud},
-	); err != nil {
+	const k = 1
+	vectors := []uint16{
+		0, 1, 2, 3, 4, Sentinel, Sentinel, 7, 8, 9, 10, 11, 12, 13,
+		100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113,
+	}
+	labels := []uint8{LabelLegit, LabelFraud}
+	centroids := []uint16{50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63}
+	offsets := []uint32{0, 2}
+
+	if err := writeBinIndex(f, n, k, vectors, labels, centroids, offsets); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	f.Close()
@@ -92,6 +96,9 @@ func TestLoadStoreFromBinaryRoundTrip(t *testing.T) {
 	if s.N != n {
 		t.Fatalf("N = %d, want %d", s.N, n)
 	}
+	if s.K != k {
+		t.Fatalf("K = %d, want %d", s.K, k)
+	}
 	if s.Vectors[5] != Sentinel || s.Vectors[6] != Sentinel {
 		t.Fatalf("expected sentinels at dims 5,6 of record 0; got %d, %d", s.Vectors[5], s.Vectors[6])
 	}
@@ -101,17 +108,40 @@ func TestLoadStoreFromBinaryRoundTrip(t *testing.T) {
 	if s.Labels[0] != LabelLegit || s.Labels[1] != LabelFraud {
 		t.Fatalf("labels: %v", s.Labels)
 	}
+	if s.Centroids[0] != 50 || s.Centroids[Dims-1] != 63 {
+		t.Fatalf("centroids first/last: %d, %d (want 50, 63)", s.Centroids[0], s.Centroids[Dims-1])
+	}
+	if s.Offsets[0] != 0 || s.Offsets[1] != 2 {
+		t.Fatalf("offsets: %v", s.Offsets)
+	}
 }
 
-func writeBinIndex(w io.Writer, n int, vectors []uint16, labels []uint8) error {
+func writeBinIndex(w io.Writer, n, k int, vectors []uint16, labels []uint8, centroids []uint16, offsets []uint32) error {
+	if err := binary.Write(w, binary.LittleEndian, BinaryMagic); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, BinaryVersion); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(Dims)); err != nil {
+		return err
+	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(n)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(k)); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, vectors); err != nil {
 		return err
 	}
-	_, err := w.Write(labels)
-	return err
+	if _, err := w.Write(labels); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, centroids); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.LittleEndian, offsets)
 }
 
 func TestLoadStorePlainJSON(t *testing.T) {

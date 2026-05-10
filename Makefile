@@ -1,5 +1,5 @@
 IMAGE := banjohann/rinha-2026-go
-TAG   := v2
+TAG   := v3
 
 .PHONY: build test run preprocess docker push compose-up compose-down clean
 
