@@ -29,14 +29,16 @@ Limites do desafio: **1 CPU e 350 MB de RAM** distribuídos entre todos os conta
 
 | Serviço | CPU  | Memória |
 |---------|------|---------|
-| HAProxy | 0.10 | 30 MB   |
-| api-1   | 0.45 | 160 MB  |
-| api-2   | 0.45 | 160 MB  |
+| HAProxy | 0.20 | 30 MB   |
+| api-1   | 0.40 | 160 MB  |
+| api-2   | 0.40 | 160 MB  |
 | **Total** | **1.00** | **350 MB** |
+
+A alocação de CPU foi ajustada na Prévia 05 após instrumentação por pprof revelar que o HAProxy era o gargalo a 0.10 CPU — as APIs estavam ociosas (~19% da própria quota) enquanto a fila de conexões no LB acumulava.
 
 ## Endpoints
 
-- `GET /ready` — retorna **503** enquanto as referências estão sendo carregadas (~5–15 s no startup); **200** depois.
+- `GET /ready` — retorna **503** enquanto o índice está sendo carregado (~200 ms desde a Fase 2, que moveu o preprocess pra build time); **200** depois.
 - `POST /fraud-score` — recebe a transação, retorna `{ approved, fraud_score }`.
 
 Contrato completo do payload em [API.md](https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/API.md).
@@ -45,10 +47,10 @@ Contrato completo do payload em [API.md](https://github.com/zanfranceschi/rinha-
 
 ```
 1. POST /fraud-score com payload de transação
-2. Decode JSON       → struct Request               (encoding/json)
+2. Decode JSON       → struct Request               (encoding/json + sync.Pool)
 3. Vetoriza          → [14]float32                  (REGRAS_DE_DETECCAO.md)
 4. Quantiza          → [14]uint16                   (mesmo formato do Store)
-5. Busca k-NN        → 5 vizinhos mais próximos     (brute-force)
+5. Busca k-NN (IVF)  → top-P clusters, depois top-5  (~8.8K refs varridos)
 6. Vota              → fraud_score = #fraud / 5
 7. Decide            → approved = fraud_score < 0.6
 8. Encode JSON       → resposta
@@ -110,25 +112,31 @@ O carregamento usa `compress/gzip` + `json.Decoder` em modo streaming — decodi
 
 Implementação em [`internal/detector/store.go`](internal/detector/store.go).
 
-### 4. Busca k-NN (k=5, brute-force)
+### 4. Busca k-NN com IVF (k=5, P=3 probes)
 
-Para cada query:
+A primeira versão fazia brute-force sobre as 3M referências. Bateu em p99 alto demais sob 0.40 CPU. A versão atual usa **IVF (Inverted File Index)**:
 
+**Build-time** (em `cmd/preprocess`):
+1. K-means com **K=1024 clusters** sobre os 3M vetores quantizados (10 iterações, init aleatória).
+2. Cada referência é atribuída ao seu centroide mais próximo.
+3. Vetores são reordenados no disco agrupados por cluster, junto com um array `Offsets[K+1]` indicando os ranges.
+
+**Query-time** (em `internal/detector/knn.go`):
 ```
-para cada referência i de 0 a N-1:
-    d² = Σ contrib(query[j], ref[j])  para j = 0..13
-    se d² < pior_distância_no_heap:
-        substitui pior pelo novo (d², label)
+1. topPCentroids(query, P=3)         → 3 clusters mais próximos
+2. para cada cluster c em top-P:
+       scanRange(query, Offsets[c], Offsets[c+1])
+3. Heap final de 5 → conta fraudes
 ```
+
+Em média **~8.788 referências** são varridas por query (3M / 1024 × 3) — ~340× menos que o brute-force. Recall@5 medido em ~99.94% (30 erros de classificação em 54K queries na Prévia 05).
 
 - **Distância**: euclidiana ao quadrado (sem `sqrt` — métrica monotônica, ranking idêntico)
 - **Sentinel**: `contrib(sentinel, sentinel) = 0` (match perfeito); `contrib(sentinel, valor) = QuantScale²` (custo máximo, separa os dois grupos)
 - **Heap**: max-heap fixo de tamanho 5 — o pior elemento (maior distância) fica no topo, então comparação contra `heap[0]` decide se vale a pena processar a referência inteira
 - **Early termination**: a soma das contribuições de cada dimensão é monotonicamente crescente — assim que `d² ≥ pior_no_heap`, abortamos a iteração da referência atual e pulamos para a próxima
 
-Custo por query: **~42 M operações inteiras** (3M refs × 14 dims), tipicamente parando bem antes nos últimos elementos por causa do early termination.
-
-Implementação em [`internal/detector/knn.go`](internal/detector/knn.go).
+Implementação em [`internal/detector/knn.go`](internal/detector/knn.go) e [`cmd/preprocess/main.go`](cmd/preprocess/main.go).
 
 ### 5. Decisão
 
@@ -143,20 +151,22 @@ Como `k = 5`, `fraud_score` só pode assumir 6 valores discretos: `0.0, 0.2, 0.4
 ## Layout do projeto
 
 ```
-cmd/api/                  entrypoint: carrega dados, sobe HTTP server
+cmd/api/                  entrypoint: carrega index.bin, sobe HTTP server
+cmd/preprocess/           build-time: gera index.bin (k-means K=1024 + reorder por cluster)
 internal/detector/
   vector.go               vetorização (14 dimensões)
   quantize.go             float32 ↔ uint16 com sentinel
-  store.go                Store em RAM, streaming gzip+JSON loader
-  knn.go                  brute-force k-NN com max-heap fixo
+  store.go                Store em RAM (vetores, labels, centroides, offsets)
+  knn.go                  IVF k-NN com max-heap fixo (P=3 probes)
   mcc.go, normalization.go  loaders dos JSONs auxiliares
   types.go                Request/Response (também usado pelo server)
 internal/server/
-  server.go               http.Server, atomic.Pointer[Store]
-  handlers.go             /ready (503/200) e /fraud-score
-data/                     normalization.json, mcc_risk.json, references.json.gz
-haproxy/haproxy.cfg       round-robin com health check em /ready
-Dockerfile                multi-stage, distroless, ~70 MB
+  server.go               http.Server, atomic.Pointer[Store], pprof/metrics opcionais
+  handlers.go             /ready (503/200) e /fraud-score com sync.Pool
+  metrics.go              instrumentação atrás de METRICS=1 / PPROF=1
+data/                     normalization.json, mcc_risk.json, index.bin
+haproxy/haproxy.cfg       round-robin, http-reuse always, health check em /ready
+Dockerfile                multi-stage; roda preprocess no builder, ~70 MB final
 docker-compose.yml        haproxy + 2 APIs com limits de CPU/RAM
 ```
 
@@ -192,16 +202,28 @@ curl -X POST localhost:9999/fraud-score \
 
 - **Sem framework HTTP**: `net/http` da stdlib é suficiente; cada handler é uma goroutine, sem middleware no caminho quente.
 - **Sem vector DB**: para 3M × 14 dims, o overhead de IPC + serialização de qualquer DB externo (pgvector, Qdrant) seria maior que o ganho. Em RAM com layout flat, o k-NN é cache-friendly.
-- **Brute-force ao invés de ANN (HNSW/IVF)**: menos código, zero parametrização, resultado exato. Pra v1 é o suficiente — ANN fica como otimização caso o p99 fique inviável.
+- **IVF ao invés de brute-force ou HNSW**: brute-force foi a v1 e bateu em p99 alto demais. HNSW tem construção cara e overhead de grafo de vizinhança que estoura o orçamento de memória. IVF com K=1024 e P=3 entrega ~99.94% de recall a um custo de ~8.8K refs varridos por query.
 - **Quantização uint16 ao invés de uint8 ou float32**: `uint8` (255 níveis) introduzia ruído mensurável no ranking dos top-5; `float32` estourava memória; `uint16` é o ponto ótimo.
-- **Pré-processamento no startup, não no build**: simplifica o desenvolvimento (mesma imagem serve qualquer dataset). Custo: `/ready` fica em 503 por ~10 s. O test runner da Rinha aguarda essa janela.
+- **Pré-processamento no build, não no startup**: a Fase 2 moveu k-means + quantização + reorder para `cmd/preprocess`, executado no builder stage do Dockerfile. Imagem runtime lê o `index.bin` mmap-friendly e fica pronta em ~200 ms.
 - **HAProxy com `option httpchk GET /ready`**: garante que requisições não cheguem nas APIs antes do Store estar pronto.
+- **HAProxy a 0.20 CPU**: descoberto via pprof na Prévia 05 — abaixo disso, o LB vira gargalo silencioso enquanto as APIs ficam ociosas.
+- **Instrumentação atrás de feature flag**: `METRICS=1` liga histogramas por estágio e `/debug/metrics`; `PPROF=1` liga `/debug/pprof/*`. Default off, custo zero em produção.
 
-## Limitações conhecidas / próximos passos
+## Resultado atual (Prévia 05)
 
-- p99 da v1 com brute-force fica na faixa de ~50–200 ms sob 0.45 CPU. Caminho de otimização: paralelizar o scan em N goroutines por query, ou trocar pra HNSW com 64 vizinhos pré-construídos.
-- Encoding/Decoding de JSON é um hot spot — substituir por `encoding/json/v2` (Go 1.26+) ou um parser custom (sonic, jsoniter) deve dar ganho mensurável.
-- O `references.json.gz` (48 MB) está dentro da imagem; mover para um build stage que pré-quantize para um formato binário compacto cortaria a imagem em ~60% e reduziria startup pra <1 s.
+- `final_score = +4671.39`
+- `p99 = 5.83 ms` no engine oficial
+- `FP = 16`, `FN = 14`, `errors = 0` em 54.100 requests (99.94% de acerto)
+- Detalhes em [`docs/history.md`](docs/history.md)
+
+## Próximos passos
+
+Os planos abaixo estão detalhados em `docs/`:
+
+- **Plano 03 — Latência** (alvo p99 < 2 ms): `GOAMD64=v3` + `unsafe.Slice` + loop unroll no `scanRange`; re-tunar IVF para K=2048 P=3; eventualmente SWAR no inner loop. Headroom: até +767 pontos. ([`docs/03-finetuning.md`](docs/03-finetuning.md))
+- **Plano 04 — Precisão** (alvo FP+FN ≤ 10): subir IVF probes de 3 pra 5, probes adaptativos por proximidade à borda do cluster, fallback brute-force para edge cases. Headroom: até +562 pontos. ([`docs/04-precisao.md`](docs/04-precisao.md))
+
+Ordem: latência primeiro (Plano 03), precisão depois (Plano 04) — porque aumentar probes adiciona trabalho por query, e queremos baseline rápido antes de pagar esse custo.
 
 ## Licença
 

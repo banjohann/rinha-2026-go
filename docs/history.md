@@ -10,6 +10,7 @@ Cada prévia é uma execução do `rinha/test` na engine oficial. Linha de basel
 | 02 | 2026-05-09 | `0cf9fe3` | **-6000** | 2001.89 ms (cap) | 45.964 | 105 | 54.100 | _idem 01 — imagem não foi republicada, código novo não foi testado_ |
 | 03 | 2026-05-09 | `f133c09` | **-6000** | 2001.90 ms (cap) | 43.273 | 118 | 54.100 | preprocess no build + k-NN paralelo + `sync.Pool` (`:v2`) |
 | 04 | 2026-05-10 | `a69d127` | **+3026.51** | 257.52 ms | 0 | 53.922 | 54.100 | **Fase 2 IVF** (k-means K=1024, P=3 probes) (`:v3`) |
+| 05 | 2026-05-10 | `704ab89` | **+4671.39** | 5.85 ms | 0 | 54.029 | 54.100 | CPU realloc 0.40/0.40/0.20 + http-reuse (`:v5`) |
 
 ## Detalhes
 
@@ -205,6 +206,56 @@ Investigação seguindo o plano de [`02-instrumentacao.md`](./02-instrumentacao.
 Local sempre subestima ~7 % vs prévia oficial. Predição: **score oficial Prévia 05 entre +4800 e +5500**.
 
 Imagem `:v5`.
+
+---
+
+### Prévia 05 — 2026-05-10 (`704ab89`, imagem `:v5`)
+
+Confirmação direta da hipótese de HAProxy starving — saímos de +3026 pra **+4671.39 (+54 %)**. p99 caiu de 257 ms pra **5.85 ms** (−44×).
+
+| Métrica | Valor | Δ vs Prévia 04 |
+|---|---|---|
+| Total de requests | 54.100 | = |
+| Acertos TP | 24.023 | +50 |
+| Acertos TN | 30.006 | +57 |
+| FP | 16 | = |
+| FN | 14 | = |
+| HTTP errors | 0 | = |
+| Failure rate | 0.06 % | = |
+| Weighted errors E | 58 | = |
+| Error rate ε | 0.001073 | ≈ |
+| p99 | **5.85 ms** | **−251.67 ms (−44×)** |
+| score_p99 | **2233.21** (cut OFF) | +1820 |
+| score_det | 2438.18 (rate=2969.44, abs_penalty=-531.26) | +1.86 |
+| **score_final** | **+4671.39** | **+1644.88** |
+
+**Predição vs realidade**: a predição era 4800-5500 baseado em "local subestima ~7 %". Fechou em 4671, **abaixo do range previsto**. Decompondo onde a predição falhou:
+- score_p99 previsto: ~2600 (de p99 ~2 ms). Real: 2233 (de p99 5.85 ms).
+- Local p99 1.73 ms vs oficial 5.85 ms → fator **3.4× pior** no oficial, não 1.07× como tinha previsto.
+- A regra "local subestima 7 %" funcionou na faixa de 200-400 ms (Prévia 04). Não funciona em sub-10 ms — outras coisas dominam o ruído (rede, scheduler, contagem fina de timers no engine).
+
+**Lição metodológica**: o p99 local e oficial não escalam linearmente. Pra previsão fina em regime de baixa latência (< 10 ms), o local serve só como **sinal direcional** ("vai melhorar ou piorar"), não como estimador absoluto.
+
+**Confirmações estruturais**:
+- `NanoCpus: 200_000_000` no HAProxy e `400_000_000` nas APIs — alocação 0.20/0.40/0.40 aplicada na engine ✓
+- Imagem servida foi `banjohann/rinha-2026-go:v5` ✓ (não há cache stale como na Prévia 02)
+- `failure_rate` e contagem de FP/FN idênticas — o algoritmo não mudou, só a infra ✓
+
+**Decomposição do score em 04 → 05**:
+- score_p99: 0 (cut) → 2233 (cut OFF) = **+2233** (o salto de 257 ms → 5.85 ms desativa o corte e habilita o componente log)
+- score_det: 2437 → 2438 = **+1** (nenhuma mudança real de qualidade)
+
+Quase todo o ganho veio do componente de latência. Detection ficou parado — mesmo dataset, mesma lógica, mesmo IVF (P=3).
+
+## Headroom restante (~1330 pontos)
+
+| Alavanca | Ganho potencial | Custo | ROI |
+|---|---|---|---|
+| p99 5.85 ms → 1 ms (teto do score_p99) | **+767** | médio (SIMD em scanRange, K menor) | alto |
+| Zerar FP+FN (16+14=30 erros) | **+562** | alto (recall do IVF, mais probes ou fallback) | médio |
+| Outras micro (decode/encode) | <50 | baixo | baixo |
+
+Como pprof já mostrou que `scanRange` é 43 % do CPU da API e a API está usando só 19 % da quota, **dá pra acelerar scanRange sem estourar nada**. Próxima rodada: atacar latência primeiro, detection depois.
 
 ---
 
